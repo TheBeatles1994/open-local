@@ -87,6 +87,13 @@ func (ns *nodeServer) mountLvmFS(ctx context.Context, req *csi.NodePublishVolume
 		}
 	}
 
+	ephemeralVolume := req.GetVolumeContext()["csi.storage.k8s.io/ephemeral"] == "true"
+	if ephemeralVolume {
+		if err := ns.ephemeralVolumeMapper.Add(targetPath, devicePath); err != nil {
+			return err
+		}
+	}
+
 	// Check targetPath
 	if _, err := os.Stat(targetPath); os.IsNotExist(err) {
 		if err := os.MkdirAll(targetPath, 0750); err != nil {

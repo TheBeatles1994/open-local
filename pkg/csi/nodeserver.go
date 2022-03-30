@@ -18,7 +18,6 @@ package csi
 
 import (
 	"fmt"
-	"os"
 	"os/exec"
 	"path"
 	"path/filepath"
@@ -26,6 +25,7 @@ import (
 	"syscall"
 
 	localtype "github.com/alibaba/open-local/pkg"
+	"github.com/alibaba/open-local/pkg/csi/mapper"
 	"github.com/alibaba/open-local/pkg/csi/server"
 	"github.com/alibaba/open-local/pkg/utils"
 	"github.com/container-storage-interface/spec/lib/go/csi"
@@ -67,12 +67,13 @@ const (
 
 type nodeServer struct {
 	*csicommon.DefaultNodeServer
-	nodeID     string
-	driverName string
-	mounter    utils.Mounter
-	client     kubernetes.Interface
-	k8smounter k8smount.Interface
-	sysPath    string
+	nodeID                string
+	driverName            string
+	mounter               utils.Mounter
+	client                kubernetes.Interface
+	k8smounter            k8smount.Interface
+	sysPath               string
+	ephemeralVolumeMapper mapper.VolumeDeviceMapper
 }
 
 var (
@@ -92,19 +93,24 @@ func newNodeServer(d *csicommon.CSIDriver, dName, nodeID, sysPath string) csi.No
 	}
 
 	mounter := k8smount.New("")
+	ephemeralVolumeMapper, err := mapper.NewVolumeDeviceLocalMapper()
+	if err != nil {
+		log.Fatalf("Error initializing device local mapper: %s", err.Error())
+	}
 
 	// local volume daemon
 	// GRPC server to provide volume manage
 	go server.Start()
 
 	return &nodeServer{
-		DefaultNodeServer: csicommon.NewDefaultNodeServer(d),
-		nodeID:            nodeID,
-		mounter:           utils.NewMounter(),
-		k8smounter:        mounter,
-		client:            kubeClient,
-		driverName:        dName,
-		sysPath:           sysPath,
+		DefaultNodeServer:     csicommon.NewDefaultNodeServer(d),
+		nodeID:                nodeID,
+		mounter:               utils.NewMounter(),
+		k8smounter:            mounter,
+		client:                kubeClient,
+		driverName:            dName,
+		sysPath:               sysPath,
+		ephemeralVolumeMapper: ephemeralVolumeMapper,
 	}
 }
 
@@ -183,67 +189,26 @@ func (ns *nodeServer) NodeUnpublishVolume(ctx context.Context, req *csi.NodeUnpu
 	targetPath := req.GetTargetPath()
 	log.Infof("NodeUnpublishVolume: Starting to unmount target path %s for volume %s", targetPath, req.VolumeId)
 
-	isMnt, err := ns.mounter.IsMounted(targetPath)
+	err := k8smount.CleanupMountPoint(targetPath, ns.k8smounter, false)
 	if err != nil {
-		if _, err := os.Stat(targetPath); os.IsNotExist(err) {
-			log.Infof("NodeUnpublishVolume: Target path not exist for volume %s with path %s", req.VolumeId, targetPath)
-			return &csi.NodeUnpublishVolumeResponse{}, nil
-		}
-		log.Errorf("NodeUnpublishVolume: Stat volume %s at path %s with error %v", req.VolumeId, targetPath, err)
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	if !isMnt {
-		_, err := os.Stat(targetPath)
-		if err != nil {
-			if os.IsNotExist(err) {
-				log.Infof("NodeUnpublishVolume: Target path %s not exist", targetPath)
-				return &csi.NodeUnpublishVolumeResponse{}, nil
-			} else {
-				log.Errorf("NodeUnpublishVolume: Stat volume %s at path %s with error %s", req.VolumeId, targetPath, err.Error())
-				return nil, status.Error(codes.Internal, fmt.Sprintf("NodeUnpublishVolume: Stat volume %s at path %s with error %s", req.VolumeId, targetPath, err.Error()))
-			}
-		}
-		log.Errorf("NodeUnpublishVolume: volume %s at path %s still existed", req.VolumeId, targetPath)
-		return nil, status.Error(codes.Internal, fmt.Sprintf("NodeUnpublishVolume: volume %s at path %s still existed", req.VolumeId, targetPath))
+		return nil, status.Errorf(codes.Internal, "failed to unmount target %q: %v", targetPath, err)
 	}
 
-	var srcDevice string = ""
-	mps, err := ns.k8smounter.List()
+	srcDevice, err := ns.ephemeralVolumeMapper.Get(req.VolumeId)
 	if err != nil {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("NodeUnpublishVolume: fail to list mountpoints: %s", err.Error()))
+		return nil, err
 	}
-	for _, mp := range mps {
-		if mp.Path == targetPath {
-			srcDevice = mp.Device
-		}
-	}
-	if srcDevice == "" {
-		return nil, status.Error(codes.Internal, fmt.Sprintf("NodeUnpublishVolume: can not get srcDevice from targetPath %s", targetPath))
-	} else {
-		log.Infof("srcDevice of targetPath %s is %s", targetPath, srcDevice)
-	}
-
-	err = ns.mounter.Unmount(req.GetTargetPath())
-	if err != nil {
-		log.Errorf("NodeUnpublishVolume: Umount volume %s for path %s with error %v", req.VolumeId, targetPath, err)
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-
-	isMnt, err = ns.mounter.IsMounted(targetPath)
-	if err != nil {
-		log.Errorf("NodeUnpublishVolume: check if path %s is mounted error %v", targetPath, err)
-		return nil, status.Error(codes.Internal, err.Error())
-	}
-	if isMnt {
-		log.Errorf("NodeUnpublishVolume: Umount volume %s for path %s not successful", req.VolumeId, targetPath)
-		return nil, status.Error(codes.Internal, fmt.Sprintf("Umount volume %s not successful", req.VolumeId))
-	}
-
-	pvSize, _, _ := getPvInfo(ns.client, req.VolumeId)
-	if pvSize == 0 {
+	if srcDevice != "" {
 		// /dev/mapper/yoda--pool0-yoda--5c523416--7288--4138--95e0--f9392995959f
 		err := removeLVMByDevicePath(srcDevice)
 		if err != nil {
+			return nil, status.Error(codes.Internal, err.Error())
+		}
+		// 此处必须要求幂等！
+		// 报错内容需要能够通过event暴露（需要检查一下）
+		// 需要重构一下lvm工具包
+		// 此处需要判断逻辑卷是否存在？
+		if err := ns.ephemeralVolumeMapper.Remove(req.VolumeId); err != nil {
 			return nil, status.Error(codes.Internal, err.Error())
 		}
 	}
