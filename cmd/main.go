@@ -28,6 +28,7 @@ import (
 	"github.com/alibaba/open-local/cmd/agent"
 	"github.com/alibaba/open-local/cmd/controller"
 	"github.com/alibaba/open-local/cmd/csi"
+	"github.com/alibaba/open-local/cmd/debug"
 	"github.com/alibaba/open-local/cmd/doc"
 	"github.com/alibaba/open-local/cmd/scheduler"
 	"github.com/alibaba/open-local/cmd/version"
@@ -57,6 +58,7 @@ func addCommands() {
 		csi.Cmd,
 		controller.Cmd,
 		version.Cmd,
+		debug.Cmd,
 		doc.Cmd.Cmd,
 	)
 }
